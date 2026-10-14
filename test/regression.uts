@@ -1237,6 +1237,210 @@ conf.verb = saved_conf_verb
 from scapy.main import _read_config_file, _probe_config_folder
 assert _read_config_file(_probe_config_folder("filethatdoesnotexistnorwillever.tsppajfsrdrr")) is None
 
+= Test conf scope basic restoration
+~ conf
+
+saved_conf_verb = conf.verb
+with conf.scope(verb=0):
+    assert conf.verb == 0
+
+assert conf.verb == saved_conf_verb
+
+with conf.scope("verb"):
+    conf.verb = 1
+    assert conf.verb == 1
+
+assert conf.verb == saved_conf_verb
+
+= Test conf scope restoration on exception
+~ conf
+
+saved_conf_verb = conf.verb
+try:
+    with conf.scope(verb=3):
+        assert conf.verb == 3
+        raise RuntimeError("boom")
+except RuntimeError:
+    pass
+
+assert conf.verb == saved_conf_verb
+
+= Test conf scope nested
+~ conf
+
+saved_conf_verb = conf.verb
+with conf.scope(verb=1):
+    assert conf.verb == 1
+    with conf.scope(verb=2):
+        assert conf.verb == 2
+    assert conf.verb == 1
+
+assert conf.verb == saved_conf_verb
+
+= Test conf scope with an interceptor hook
+~ conf
+
+from scapy.config import Conf, Interceptor
+
+_scope_hook_calls = []
+
+def _scope_hook(attr, val, old):
+    _scope_hook_calls.append((val, old))
+    return val + "!"
+
+Conf.utsscope = Interceptor("utsscope", "init", _scope_hook)
+try:
+    assert conf.utsscope == "init"
+    with conf.scope(utsscope="a"):
+        assert conf.utsscope == "a!"
+        assert _scope_hook_calls == [("a", "init")]
+        # the global storage is untouched while the scope is active
+        assert conf.__dict__.get("_intercepted_utsscope") == "init"
+    assert conf.utsscope == "init"
+    # leaving a scope does not run the hook again
+    assert _scope_hook_calls == [("a", "init")]
+    # a direct assignment outside a scope keeps the historical behavior
+    conf.utsscope = "b"
+    assert conf.utsscope == "b!"
+finally:
+    del Conf.utsscope
+    conf.__dict__.pop("_intercepted_utsscope", None)
+
+= Test conf scope nested interceptor hook
+~ conf
+
+from scapy.config import Conf, Interceptor
+
+def _scope_hook2(attr, val, old):
+    return (val, old)
+
+Conf.utsscope2 = Interceptor("utsscope2", 0, _scope_hook2)
+try:
+    with conf.scope(utsscope2=1):
+        assert conf.utsscope2 == (1, 0)
+        with conf.scope(utsscope2=2):
+            assert conf.utsscope2 == (2, (1, 0))
+        assert conf.utsscope2 == (1, 0)
+    assert conf.utsscope2 == 0
+finally:
+    _uts_scope2_global = conf.__dict__.pop("_intercepted_utsscope2", None)
+    del Conf.utsscope2
+
+assert _uts_scope2_global == 0
+assert "utsscope2" not in Conf.__dict__
+
+= Test conf scope interceptor hook rejection
+~ conf
+
+from scapy.config import Conf, Interceptor
+
+def _scope_hook3(attr, val, old):
+    if val == "bad":
+        raise ValueError("rejected")
+    return val
+
+Conf.utsscope3 = Interceptor("utsscope3", "init", _scope_hook3)
+try:
+    with conf.scope(utsscope3="ok"):
+        assert conf.utsscope3 == "ok"
+        try:
+            conf.utsscope3 = "bad"
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("the hook rejection did not propagate")
+        assert conf.utsscope3 == "ok"
+    assert conf.utsscope3 == "init"
+    # a rejection while entering must not leave an active scope
+    try:
+        with conf.scope(utsscope3="bad"):
+            pass
+    except ValueError:
+        pass
+    assert conf.utsscope3 == "init"
+    with conf.scope(verb=0):
+        assert conf.verb == 0
+finally:
+    del Conf.utsscope3
+    conf.__dict__.pop("_intercepted_utsscope3", None)
+
+= Test conf scope read-only rejection
+~ conf
+
+saved_conf_version = conf.version
+try:
+    with conf.scope(version="42"):
+        pass
+except ValueError as ex:
+    assert str(ex) == "Read-only value !"
+else:
+    raise AssertionError("read-only field was accepted in a scope")
+
+assert conf.version == saved_conf_version
+
+= Test conf scope captures hook side effects
+~ conf
+
+from scapy.config import Conf, Interceptor
+
+def _scope_hook4(attr, val, old):
+    conf.utssideeffect = val
+    return val
+
+Conf.utsscope4 = Interceptor("utsscope4", "init", _scope_hook4)
+try:
+    assert not hasattr(conf, "utssideeffect")
+    with conf.scope(utsscope4="x"):
+        assert conf.utssideeffect == "x"
+    assert not hasattr(conf, "utssideeffect")
+    assert conf.utsscope4 == "init"
+finally:
+    del Conf.utsscope4
+    conf.__dict__.pop("_intercepted_utsscope4", None)
+    conf.__dict__.pop("utssideeffect", None)
+
+= Test conf scope undeclared writes bypass it
+~ conf
+
+saved_conf_verb = conf.verb
+saved_conf_checkIPID = conf.checkIPID
+with conf.scope(checkIPID=not saved_conf_checkIPID):
+    # 'verb' is not declared by this scope: assignment is global
+    conf.verb = 3
+    assert conf.verb == 3
+
+assert conf.verb == 3
+assert conf.checkIPID == saved_conf_checkIPID
+conf.verb = saved_conf_verb
+
+= Test conf scope thread isolation
+~ conf
+
+import threading
+
+saved_conf_verb = conf.verb
+_scope_seen = {}
+_scope_barrier = threading.Barrier(2, timeout=10)
+
+def _conf_scope_worker():
+    with conf.scope(verb=123):
+        _scope_barrier.wait()
+        _scope_seen["worker_inside"] = conf.verb
+    _scope_seen["worker_after"] = conf.verb
+
+_conf_scope_thread = threading.Thread(target=_conf_scope_worker)
+_conf_scope_thread.start()
+_scope_barrier.wait()
+_scope_seen["main_during"] = conf.verb
+_conf_scope_thread.join(5)
+assert not _conf_scope_thread.is_alive()
+assert _scope_seen == {
+    "worker_inside": 123,
+    "worker_after": saved_conf_verb,
+    "main_during": saved_conf_verb,
+}
+assert conf.verb == saved_conf_verb
+
 = Test CacheInstance repr
 
 conf.netcache

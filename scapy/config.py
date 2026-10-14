@@ -15,6 +15,7 @@ import pathlib
 import re
 import socket
 import sys
+import threading
 import time
 import warnings
 
@@ -47,6 +48,7 @@ from typing import (
     List,
     NoReturn,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -87,7 +89,7 @@ class ConfClass(object):
         dkeys.update(self.__dict__)
         keys = sorted(dkeys)
         for i in keys:
-            if i[0] != "_":
+            if i[0] != "_" and not callable(getattr(self, i)):
                 r = repr(getattr(self, i))
                 r = " ".join(r.split())
                 wlen = 76 - max(len(i), 10)
@@ -114,16 +116,17 @@ class Interceptor(object):
         self.kargs = kargs if kargs is not None else {}
 
     def __get__(self, obj, typ=None):
-        # type: (Conf, Optional[type]) -> Any
-        if not hasattr(obj, self.intname):
-            setattr(obj, self.intname, self.default)
-        return getattr(obj, self.intname)
+        # type: (Optional[ConfClass], Optional[type]) -> Any
+        if obj is None:
+            return self
+        if self.intname not in obj.__dict__:
+            obj.__dict__[self.intname] = self.default
+        return obj.__dict__[self.intname]
 
     @staticmethod
     def set_from_hook(obj, name, val):
-        # type: (Conf, str, bool) -> None
-        int_name = "_intercepted_%s" % name
-        setattr(obj, int_name, val)
+        # type: (Conf, str, Any) -> None
+        obj._conf_store_raw(name, val)
 
     def __set__(self, obj, val):
         # type: (Conf, Any) -> None
@@ -144,6 +147,97 @@ ReadOnlyAttribute = functools.partial(
     hook=(lambda name, *args, **kwargs: _readonly(name))
 )
 ReadOnlyAttribute.__doc__ = "Read-only class attribute"
+
+
+class _ConfScopeLocal(threading.local):
+    def __init__(self):
+        # type: () -> None
+        # One stack of active scopes per Conf instance, for this thread only
+        self.stacks = {}  # type: Dict[int, List["ConfScope"]]
+
+
+_conf_scope_local = _ConfScopeLocal()
+
+
+def _conf_scope_stack(conf):
+    # type: (Conf) -> Sequence["ConfScope"]
+    """Return the active scope layers for conf in the current thread.
+
+    An empty sequence means no scope is active.
+    """
+    return _conf_scope_local.stacks.get(id(conf)) or ()
+
+
+def _conf_cascade_layer(stack):
+    # type: (Sequence["ConfScope"]) -> Optional["ConfScope"]
+    """Return the layer owning an Interceptor hook running on this thread."""
+    for layer in reversed(stack):
+        if layer._hook_depth:
+            return layer
+    return None
+
+
+class ConfScope(object):
+    """A thread-local, nestable configuration scope.
+
+    The fields given at entry are the only ones the scope is allowed to
+    override on direct assignment. Assignments made inside the scope,
+    including the values rewritten or set by Interceptor hooks, are stored in
+    the scope layer; fields overridden by outer scopes remain visible until
+    shadowed. When the scope is left, even through an exception, the layer is
+    detached: values visible before entry become visible again without any
+    hook being called again.
+
+    Scopes are bound to the thread that entered them. A scope active in one
+    thread never affects reads or writes performed in another thread.
+
+    Assignments to fields that the scope does not declare, and that are not a
+    side effect of a hook, bypass the scope exactly as they would outside of
+    it.
+    """
+
+    def __init__(self, conf, names, initial):
+        # type: (Conf, Tuple[str, ...], Dict[str, Any]) -> None
+        self._conf = conf
+        self._declared = set(names) | set(initial)  # type: Set[str]
+        self._initial = initial
+        self._values = {}  # type: Dict[str, Any]
+        self._hook_depth = 0
+
+    def _attach(self):
+        # type: () -> None
+        stacks = _conf_scope_local.stacks
+        stacks.setdefault(id(self._conf), []).append(self)
+
+    def _detach(self):
+        # type: () -> None
+        stack = _conf_scope_local.stacks.get(id(self._conf))
+        if not stack:
+            return
+        if stack[-1] is self:
+            stack.pop()
+            return
+        try:
+            stack.remove(self)
+        except ValueError:
+            # Already detached (e.g. after a failure while entering)
+            pass
+
+    def __enter__(self):
+        # type: () -> "ConfScope"
+        self._attach()
+        try:
+            for name, val in self._initial.items():
+                setattr(self._conf, name, val)
+        except BaseException:
+            self._detach()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # type: (Any, Any, Any) -> bool
+        self._detach()
+        return False
 
 
 class ProgPath(ConfClass):
@@ -1206,6 +1300,89 @@ class Conf(ConfClass):
     #: Disables auto-stripping of StrFixedLenField for debugging purposes
     debug_strfixedlenfield = False
 
+    def scope(self, *names, **kwargs):
+        # type: (*str, **Any) -> ConfScope
+        """Return a thread-local, nestable configuration scope.
+
+        ``names`` declare the fields the scope is allowed to override; they
+        can be assigned inside the ``with`` block. ``kwargs`` are assigned to
+        the scope as soon as it is entered. Fields are restored to the value
+        they had before entry when the block is left, without running the
+        Interceptor hooks again.
+
+        Example::
+
+            with conf.scope(verb=0):
+                send(IP(dst="192.0.2.1"))
+
+            with conf.scope("verb"):
+                conf.verb = 0
+                ...
+        """
+        return ConfScope(self, names, kwargs)
+
+    def _conf_interceptor(self, attr):
+        # type: (str) -> Optional[Interceptor]
+        """Return the Interceptor descriptor backing attr, if any."""
+        for cls in type(self).__mro__:
+            descriptor = cls.__dict__.get(attr)
+            if isinstance(descriptor, Interceptor):
+                return descriptor
+        return None
+
+    def _conf_raw_value(self, interceptor, stack):
+        # type: (Interceptor, Sequence[ConfScope]) -> Any
+        """Effective stored value of an intercepted field."""
+        for layer in reversed(stack):
+            if interceptor.name in layer._values:
+                return layer._values[interceptor.name]
+        return self.__dict__.get(interceptor.intname, interceptor.default)
+
+    def _conf_store_raw(self, name, val):
+        # type: (str, Any) -> None
+        """Store a value produced from inside an Interceptor hook."""
+        layer = _conf_cascade_layer(_conf_scope_stack(self))
+        if layer is not None:
+            layer._values[name] = val
+        else:
+            object.__setattr__(self, "_intercepted_%s" % name, val)
+
+    def __setattr__(self, attr, val):
+        # type: (str, Any) -> None
+        stack = _conf_scope_stack(self)
+        interceptor = self._conf_interceptor(attr)
+        # A write belongs to the layer running a hook (hook side effects),
+        # otherwise to the innermost active scope that declared the field.
+        layer = _conf_cascade_layer(stack)
+        if layer is None and stack:
+            for candidate in reversed(stack):
+                if attr in candidate._declared:
+                    layer = candidate
+                    break
+        if interceptor is not None:
+            if layer is not None:
+                old = self._conf_raw_value(interceptor, stack)
+                layer._hook_depth += 1
+                try:
+                    new_val = interceptor.hook(
+                        interceptor.name, val, old,
+                        *interceptor.args, **interceptor.kargs
+                    )
+                finally:
+                    layer._hook_depth -= 1
+                layer._values[interceptor.name] = new_val
+            else:
+                old = self.__dict__.get(interceptor.intname, interceptor.default)
+                new_val = interceptor.hook(
+                    interceptor.name, val, old,
+                    *interceptor.args, **interceptor.kargs
+                )
+                object.__setattr__(self, interceptor.intname, new_val)
+        elif layer is not None:
+            layer._values[attr] = val
+        else:
+            object.__setattr__(self, attr, val)
+
     def __getattribute__(self, attr):
         # type: (str) -> Any
         # Those are loaded on runtime to avoid import loops
@@ -1233,6 +1410,10 @@ class Conf(ConfClass):
                 DeprecationWarning
             )
             attr = "iface"
+        stack = _conf_scope_stack(self)
+        for layer in reversed(stack):
+            if attr in layer._values:
+                return layer._values[attr]
         return object.__getattribute__(self, attr)
 
 

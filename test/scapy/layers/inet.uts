@@ -140,7 +140,7 @@ assert len(buffer) == MTU + 2
 
 buffer = StringBuffer()
 buffer.append(b"A", 1)
-buffer.append(b"B", MTU + 3)
+assert buffer.append(b"B", MTU + 3) is False
 assert bytes(buffer) == b"A"
 
 buffer = StringBuffer()
@@ -150,7 +150,7 @@ assert bytes(buffer) == b"C" + b"\x00" * MTU + b"A"
 
 buffer = StringBuffer()
 buffer.append(b"A", 1)
-buffer.append(b"C", -MTU - 1)
+assert buffer.append(b"C", -MTU - 1) is False
 assert bytes(buffer) == b"A"
 
 = StringBuffer max_gap is configurable
@@ -632,6 +632,333 @@ with no_debug_dissector(reverse=True):
     assert pkts[0][CustomPacket].a == b"abcde", "retransmitted failure"
 
 split_layers(TCP, CustomPacket, sport=12345)
+
+
+= Sessions without limits expose no quota state
+~ TCP session
+
+s = IPSession()
+assert s.quota_stats is None and s.eviction_log is None
+assert s.cleanup_idle() == []
+s = TCPSession()
+assert s.quota_stats is None and s.eviction_log is None
+assert s.cleanup_idle() == []
+True
+
+= StringBuffer max_size hard cap
+~ TCP session
+
+buf = StringBuffer()
+assert buf.append(b"a" * 8, 1, max_size=8) is True
+assert buf.append(b"b" * 8, 9, max_size=8) is False
+assert len(buf) == 8 and bytes(buf) == b"a" * 8
+assert StringBuffer().append(b"a") is True
+True
+
+= IPSession quotas reject invalid parameters
+~ TCP session
+
+from scapy.sessions import (
+    SESSION_LIMIT_EVICT,
+    SESSION_LIMIT_FAIL,
+    SessionLimitExceeded,
+)
+
+for bad_kwargs in (
+    {"max_connections": 0},
+    {"max_buffer": -1},
+    {"idle_timeout": 0},
+    {"on_limit": "nope"},
+    {"eviction_log_size": 0},
+):
+    try:
+        IPSession(**bad_kwargs)
+        raise AssertionError("expected ValueError: %r" % bad_kwargs)
+    except ValueError:
+        pass
+
+True
+
+= IPSession quota - reject, evict and fail policies
+~ TCP session
+
+def quota_ip_frag(pid, ts):
+    p = IP(src="10.0.0.1", dst="10.0.0.2", id=pid, flags="MF") / Raw(b"x" * 8)
+    p.time = ts
+    return p
+
+
+# reject (default): packets of the new group are dropped and counted
+s = IPSession(max_connections=2)
+assert [s.process(quota_ip_frag(i, i)) for i in range(3)] == [
+    None, None, None
+]
+assert s.quota_stats["rejected_connections"] == 1
+assert len(s.fragments) == 2
+assert len(s.eviction_log) == 0
+
+# evict: the least recently used group is removed and recorded
+s = IPSession(max_connections=2, on_limit=SESSION_LIMIT_EVICT)
+for i in range(3):
+    s.process(quota_ip_frag(i, i))
+
+assert s.quota_stats["evicted_connections"] == 1
+record = s.eviction_log[-1]
+assert record.table == "ip"
+assert record.reason == "evicted_oldest"
+assert record.key[0] == 0 and record.buffered == 8
+assert 0 not in [key[0] for key in s.fragments]
+assert len(s.fragments) == 2
+
+# fail: processing raises and is counted
+s = IPSession(max_connections=2, on_limit=SESSION_LIMIT_FAIL)
+s.process(quota_ip_frag(0, 0))
+s.process(quota_ip_frag(1, 1))
+try:
+    s.process(quota_ip_frag(2, 2))
+    raise AssertionError("SessionLimitExceeded not raised")
+except SessionLimitExceeded as exc:
+    assert exc.table == "ip" and exc.key[0] == 2
+
+assert s.quota_stats["failed_packets"] == 1
+assert len(s.fragments) == 2
+True
+
+= IPSession quota - idle timeout and cleanup_idle
+~ TCP session
+
+s = IPSession(idle_timeout=10)
+s.process(quota_ip_frag(0, 100))
+s.process(quota_ip_frag(1, 120))
+assert s.quota_stats["expired_connections"] == 1
+record = s.eviction_log[-1]
+assert record.table == "ip"
+assert record.reason == "idle_timeout"
+assert record.key[0] == 0
+assert record.last_seen == 100 and record.removed_at == 120
+assert record.buffered == 8
+assert 0 not in [key[0] for key in s.fragments]
+assert len(s.fragments) == 1
+
+s = IPSession(idle_timeout=10)
+s.process(quota_ip_frag(0, 100))
+removed = s.cleanup_idle(now=111)
+assert len(removed) == 1
+assert removed[0].key[0] == 0 and removed[0].reason == "idle_timeout"
+assert len(s.fragments) == 0
+assert s.cleanup_idle(now=112) == []
+True
+
+= IPSession quota - completed groups free slots and per-group buffer cap
+~ TCP session
+
+s = IPSession(max_connections=1)
+datagram = IP(src="10.0.0.1", dst="10.0.0.2", id=7) / Raw(b"datadata")
+result = None
+for f in fragment(datagram, fragsize=8):
+    result = s.process(f)
+
+assert result is not None and bytes(result.payload) == b"datadata"
+assert len(s.fragments) == 0
+assert s.quota_stats["rejected_connections"] == 0
+
+s = IPSession(max_buffer=8)
+s.process(quota_ip_frag(0, 0))
+assert s.process(quota_ip_frag(0, 1)) is None
+assert s.quota_stats["buffer_dropped_packets"] == 1
+uid = list(s.fragments)[0]
+assert sum(frag[2] for frag in s.fragments[uid]) == 8
+True
+
+= TCPSession quota - reject, evict and fail policies
+~ TCP session
+
+class QuotaTestPacket(Packet):
+    name = "QuotaTestPacket"
+    fields_desc = [StrFixedLenField("data", b"", length=16)]
+    @classmethod
+    def tcp_reassemble(cls, data, metadata, session):
+        if len(data) < 16:
+            return None
+        return cls(data)
+
+
+bind_layers(TCP, QuotaTestPacket, dport=44444)
+bind_layers(TCP, QuotaTestPacket, sport=44444)
+
+
+def quota_tcp_seg(sport, dport, seq, payload, ts=0,
+                  src="1.0.0.1", dst="2.0.0.2"):
+    p = IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, seq=seq)
+    p = p / Raw(payload)
+    p = IP(raw(p))
+    p.time = ts
+    return p
+
+
+# reject
+s = TCPSession(max_connections=2)
+for i in range(3):
+    assert s.process(quota_tcp_seg(40001 + i, 44444, 1, b"x" * 8)) is None
+
+assert s.quota_stats["rejected_connections"] == 1
+assert len(s.tcp_frags) == 2
+
+# evict
+s = TCPSession(max_connections=2, on_limit=SESSION_LIMIT_EVICT)
+for i in range(3):
+    s.process(quota_tcp_seg(40001 + i, 44444, 1, b"x" * 8, ts=i))
+
+assert s.quota_stats["evicted_connections"] == 1
+record = s.eviction_log[-1]
+assert record.table == "tcp" and record.reason == "evicted_oldest"
+assert len(s.tcp_frags) == 2
+assert len(s.tcp_sessions) == 2
+
+# fail
+s = TCPSession(max_connections=2, on_limit=SESSION_LIMIT_FAIL)
+s.process(quota_tcp_seg(40001, 44444, 1, b"x" * 8))
+s.process(quota_tcp_seg(40002, 44444, 1, b"x" * 8))
+try:
+    s.process(quota_tcp_seg(40003, 44444, 1, b"x" * 8))
+    raise AssertionError("SessionLimitExceeded not raised")
+except SessionLimitExceeded as exc:
+    assert exc.table == "tcp"
+
+assert s.quota_stats["failed_packets"] == 1
+assert len(s.tcp_frags) == 2
+True
+
+= TCPSession quota - three policies are distinguishable through sniff
+~ TCP session
+
+segments = [
+    quota_tcp_seg(40001, 44444, 1, b"x" * 8),
+    quota_tcp_seg(40002, 44444, 1, b"x" * 8),
+    quota_tcp_seg(40003, 44444, 1, b"x" * 8),
+]
+
+s = TCPSession(max_connections=2)
+assert len(sniff(offline=segments, session=s)) == 0
+assert s.quota_stats["rejected_connections"] == 1
+
+s = TCPSession(max_connections=2, on_limit=SESSION_LIMIT_EVICT)
+assert len(sniff(offline=segments, session=s)) == 0
+assert s.quota_stats["evicted_connections"] == 1
+
+with no_debug_dissector():
+    s = TCPSession(max_connections=2, on_limit=SESSION_LIMIT_FAIL)
+    pkts = sniff(offline=segments, session=s)
+    # FAIL yields the raw segment instead of buffering it
+    assert len(pkts) == 1 and TCP in pkts[0]
+    assert s.quota_stats["failed_packets"] == 1
+
+True
+
+= TCPSession quota - completion frees slots and per-flow buffer cap
+~ TCP session
+
+s = TCPSession(max_connections=1)
+assert s.process(quota_tcp_seg(40001, 44444, 1, b"a" * 8)) is None
+packet = s.process(quota_tcp_seg(40001, 44444, 9, b"b" * 8))
+assert packet is not None
+assert packet[QuotaTestPacket].data == b"a" * 8 + b"b" * 8
+assert len(s.tcp_frags) == 0
+assert s.process(quota_tcp_seg(40002, 44444, 1, b"c" * 8)) is None
+assert s.quota_stats["rejected_connections"] == 0
+
+s = TCPSession(max_buffer=8)
+s.process(quota_tcp_seg(40001, 44444, 1, b"a" * 8))
+s.process(quota_tcp_seg(40001, 44444, 9, b"b" * 8))
+assert s.quota_stats["buffer_dropped_packets"] == 1
+buf = list(s.tcp_frags.values())[0][0]
+assert len(buf) == 8 and bytes(buf) == b"a" * 8
+True
+
+= TCPSession quota - idle eviction and bidirectional session handling
+~ TCP session
+
+s = TCPSession(idle_timeout=20)
+s.process(quota_tcp_seg(40001, 44444, 1, b"a" * 8, ts=100))
+s.process(quota_tcp_seg(
+    44444, 40001, 1, b"b" * 8, ts=100,
+    src="2.0.0.2", dst="1.0.0.1",
+))
+s.process(quota_tcp_seg(40002, 44444, 1, b"c" * 8, ts=125))
+assert s.quota_stats["expired_connections"] == 2
+assert len(s.tcp_frags) == 1
+assert len(s.tcp_sessions) == 1
+
+# a still-alive reverse direction keeps the shared bidi session dict
+s = TCPSession(idle_timeout=20)
+s.process(quota_tcp_seg(40001, 44444, 1, b"a" * 8, ts=100))
+s.process(quota_tcp_seg(
+    44444, 40001, 1, b"b" * 8, ts=105,
+    src="2.0.0.2", dst="1.0.0.1",
+))
+s.process(quota_tcp_seg(40002, 44444, 1, b"c" * 8, ts=124))
+assert s.quota_stats["expired_connections"] == 1
+assert len(s.tcp_frags) == 2
+assert len(s.tcp_sessions) == 2
+assert s.eviction_log[-1].reason == "idle_timeout"
+assert s.eviction_log[-1].table == "tcp"
+True
+
+= TCPSession quota - concurrent cleanup never sees torn state
+~ TCP session
+
+import threading
+import time as quota_time
+
+s = TCPSession(
+    max_connections=50,
+    idle_timeout=0.001,
+    on_limit=SESSION_LIMIT_EVICT,
+)
+quota_errors = []
+
+
+def quota_safe_process(pkt):
+    try:
+        s.process(pkt)
+    except Exception as exc:
+        quota_errors.append(exc)
+
+
+def quota_safe_cleanup():
+    try:
+        s.cleanup_idle()
+    except Exception as exc:
+        quota_errors.append(exc)
+
+
+def quota_worker():
+    for i in range(200):
+        quota_safe_process(quota_tcp_seg(
+            40000 + (i % 180),
+            44444,
+            1 + (i % 4) * 8,
+            b"z" * 8,
+            ts=quota_time.monotonic(),
+        ))
+
+
+def quota_cleaner():
+    for _ in range(200):
+        quota_safe_cleanup()
+
+
+t1 = threading.Thread(target=quota_worker)
+t2 = threading.Thread(target=quota_cleaner)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+assert quota_errors == []
+True
+
+split_layers(TCP, QuotaTestPacket, dport=44444)
+split_layers(TCP, QuotaTestPacket, sport=44444)
 
 
 = Layer binding

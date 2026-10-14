@@ -498,3 +498,259 @@ test_am(
     secret="SECRET",
     IDENTITIES={"victim": "known-good-password"}
 )
+
+
++ Answering machines catalog and reports
+
+= Catalog test helpers
+from unittest import mock
+answering_machines.clear()
+
+class _CatalogTestAM(AnsweringMachine):
+    """Minimal answering machine used by the catalog tests."""
+    def make_reply(self, req):
+        return req
+
+class _FilterMissAM(_CatalogTestAM):
+    def is_request(self, req):
+        return 0
+
+class _NoReplyAM(_CatalogTestAM):
+    def make_reply(self, req):
+        return None
+
+class _BuildErrorAM(_CatalogTestAM):
+    def make_reply(self, req):
+        raise RuntimeError("cannot build the reply")
+
+class _SendErrorAM(_CatalogTestAM):
+    def send_reply(self, reply, send_function=None):
+        raise OSError("cannot send the reply")
+
+assert issubclass(_CatalogTestAM, AnsweringMachine)
+
+= Machines start with empty counters and keep cataloging options out of parse_options
+status = _CatalogTestAM(verbose=False).am_status()
+assert status["running"] is False
+assert status["packets_received"] == 0
+assert status["replies_sent"] == 0
+assert status["dropped"] == {"filter_miss": 0, "build_failure": 0,
+                             "send_failure": 0}
+assert status["last_activity"] is None
+named = _CatalogTestAM(verbose=False, name="mine", group="g1")
+assert named.am_status()["name"] == "mine"
+assert named.am_status()["group"] == "g1"
+# Existing machines keep their class-level BPF filter
+assert ARP_am(IP_addr="1.2.3.4").am_status()["filter"] == "arp"
+
+= Counters classify answered packets and every silent drop
+answered = _CatalogTestAM(verbose=False)
+answered.send_reply = lambda reply: None
+answered.reply(Ether()/ARP())
+
+missed = _FilterMissAM(verbose=False)
+missed.reply(Ether())
+
+no_reply = _NoReplyAM(verbose=False)
+no_reply.reply(Ether())
+
+build_error = _BuildErrorAM(verbose=False)
+build_raised = False
+try:
+    build_error.reply(Ether())
+except RuntimeError:
+    build_raised = True
+
+send_error = _SendErrorAM(verbose=False)
+send_raised = False
+try:
+    send_error.reply(Ether())
+except OSError:
+    send_raised = True
+
+assert build_raised and send_raised  # original behavior: exceptions propagate
+for machine, key in (
+    (missed, "filter_miss"),
+    (no_reply, "build_failure"),
+    (build_error, "build_failure"),
+    (send_error, "send_failure"),
+):
+    status = machine.am_status()
+    assert status["packets_received"] == 1
+    assert status["replies_sent"] == 0
+    assert status["dropped"][key] == 1
+
+status = answered.am_status()
+assert status["packets_received"] == 1
+assert status["replies_sent"] == 1
+assert sum(status["dropped"].values()) == 0
+assert status["last_activity"] is not None
+
+= A foreground machine is cataloged while sniffing and unregistered afterwards
+@mock.patch("scapy.ansmachine.sniff")
+def run_foreground(mock_sniff, **kwargs):
+    seen = {}
+    def fake_sniff(**sniff_kwargs):
+        sniff_kwargs["prn"](Ether()/ARP())
+        seen["report"] = answering_machines.report()
+    mock_sniff.side_effect = fake_sniff
+    machine = _CatalogTestAM(verbose=False, **kwargs)
+    machine.send_reply = lambda reply: None
+    machine()
+    return machine, seen["report"]
+
+machine, report = run_foreground(filter="arp", iface="lo0", name="fg1")
+[entry] = [m for m in report["machines"] if m["name"] == "fg1"]
+assert entry["running"] is True
+assert entry["filter"] == "arp"
+assert entry["iface"] == "lo0"
+assert entry["packets_received"] == 1
+assert entry["replies_sent"] == 1
+assert entry["dropped"] == {"filter_miss": 0, "build_failure": 0,
+                            "send_failure": 0}
+assert answering_machines.get("fg1") is None
+assert answering_machines.names() == []
+
+= A machine is unregistered even when answering raises
+@mock.patch("scapy.ansmachine.sniff")
+def run_failing_foreground(mock_sniff):
+    def fake_sniff(**sniff_kwargs):
+        raise AssertionError("prn failure")
+    mock_sniff.side_effect = fake_sniff
+    failing = _CatalogTestAM(verbose=False, name="fail1")
+    raised = False
+    try:
+        failing()
+    except AssertionError:
+        raised = True
+    return raised
+
+assert run_failing_foreground()
+assert answering_machines.names() == []
+answering_machines.clear()
+
+= Overlapping BPF filters in the same group are declared at registration
+overlap_machines = {}
+for key, bpf_filter, iface, group in (
+    ("a", " arp ", "eth0", "default"),   # whitespace-normalized overlap
+    ("b", "arp", "eth0", "default"),
+    ("c", "udp port 53", "eth0", "default"),
+    ("d", "arp", "eth1", "default"),     # different interface
+    ("e", "arp", "eth0", "other"),       # different group
+    ("f", "", "eth0", "default"),        # catch-all, overlaps a, b and c
+):
+    overlap_machine = _CatalogTestAM(verbose=False, name=key, group=group)
+    overlap_machine.optsniff = {"filter": bpf_filter or None, "iface": iface}
+    overlap_machines[key] = overlap_machine
+    answering_machines.register(overlap_machine)
+
+report = answering_machines.report()
+pairs = {tuple(overlap["machines"]) for overlap in report["overlaps"]}
+assert pairs == {("a", "b"), ("a", "f"), ("b", "f"), ("c", "f")}, pairs
+status = {m["name"]: m for m in report["machines"]}
+assert status["a"]["overlaps"] == ["b", "f"]
+assert status["b"]["overlaps"] == ["a", "f"]
+assert status["c"]["overlaps"] == ["f"]
+assert status["d"]["overlaps"] == []
+assert status["e"]["overlaps"] == []
+assert answering_machines.report(group="other")["overlaps"] == []
+assert answering_machines.names(group="other") == ["e"]
+notices = {(notice["machine"], notice["other"])
+           for notice in report["notices"]}
+assert ("b", "a") in notices
+assert ("f", "a") in notices and ("f", "b") in notices and ("f", "c") in notices
+answering_machines.unregister(overlap_machines["b"])
+assert ("a", "b") not in {
+    tuple(overlap["machines"])
+    for overlap in answering_machines.report()["overlaps"]
+}
+answering_machines.clear()
+
+= Catalog names default to the class name and duplicates are disambiguated
+auto1 = _CatalogTestAM(verbose=False)
+auto2 = _CatalogTestAM(verbose=False)
+auto1.optsniff = {"filter": "tcp port 1"}
+auto2.optsniff = {"filter": "tcp port 2"}
+name1 = answering_machines.register(auto1)
+name2 = answering_machines.register(auto2)
+assert name1 != name2
+assert name1.startswith("_CatalogTestAM#")
+duplicate = _CatalogTestAM(verbose=False, name=name1)
+duplicate.optsniff = {"filter": "tcp port 3"}
+assert answering_machines.register(duplicate) == name1 + "#2"
+answering_machines.clear()
+
+= Stopping a background sniffer unregisters the machine
+from scapy.ansmachine import _CatalogAsyncSniffer
+background = _CatalogTestAM(verbose=False, name="bg1")
+background.optsniff = {"filter": "arp"}
+answering_machines.register(background)
+sniffer = _CatalogAsyncSniffer(background, **background.optsniff)
+sniffer.running = True
+assert "bg1" in answering_machines.names()
+sniffer.stop()
+assert "bg1" not in answering_machines.names()
+answering_machines.clear()
+
+= format_report exposes the same information as a text table
+reported = _CatalogTestAM(verbose=False, name="rep1")
+reported.optsniff = {"filter": "arp", "iface": "eth0"}
+answering_machines.register(reported)
+text = answering_machines.format_report()
+answering_machines.clear()
+assert "rep1" in text and "arp" in text and "running" in text
+
+= Concurrent answers and concurrent report reads never lose or corrupt counts
+import threading
+
+count1 = _CatalogTestAM(verbose=False, name="count1")
+count2 = _CatalogTestAM(verbose=False, name="count2")
+count1.send_reply = count2.send_reply = lambda reply: None
+count1.optsniff = {"filter": "tcp port 443"}
+count2.optsniff = {"filter": "tcp port 444"}
+answering_machines.register(count1)
+answering_machines.register(count2)
+n = 500
+errors = []
+stop_reading = threading.Event()
+
+def answer_loop(machine):
+    try:
+        for _ in range(n):
+            machine.reply(Ether()/ARP())
+    except Exception as exc:
+        errors.append(exc)
+
+def read_loop():
+    try:
+        while not stop_reading.is_set():
+            concurrent_report = answering_machines.report()
+            for entry in concurrent_report["machines"]:
+                assert entry["packets_received"] >= (
+                    entry["replies_sent"] + sum(entry["dropped"].values())
+                )
+            answering_machines.format_report()
+    except Exception as exc:
+        errors.append(exc)
+
+worker1 = threading.Thread(target=answer_loop, args=(count1,))
+worker2 = threading.Thread(target=answer_loop, args=(count2,))
+reader = threading.Thread(target=read_loop)
+worker1.start()
+worker2.start()
+reader.start()
+worker1.join()
+worker2.join()
+stop_reading.set()
+reader.join()
+assert not errors, errors
+for machine in (count1, count2):
+    status = machine.am_status()
+    assert status["packets_received"] == n
+    assert status["replies_sent"] == n
+    assert sum(status["dropped"].values()) == 0
+
+concurrent_report = answering_machines.report()
+assert sum(m["packets_received"]
+           for m in concurrent_report["machines"]) == 2 * n
+answering_machines.clear()

@@ -742,3 +742,290 @@ p.stop()
 result
 assert result.startswith(b"HTTP/1.1 200 OK") or result.startswith(b"HTTP/1.1 302 Found")
 
++ Backpressure and quota tests
+
+= PipeLink declarations and validation
+
+link = PipeLink(name="bp", queue_maxsize=5)
+assert link.name == "bp"
+assert link.state == "active"
+assert link.backlog == 0 and link.dropped == 0 and link.delivered == 0
+buf = link.buffer()
+assert buf.link is link
+assert buf.q.maxsize == 5
+
+def expect_valueerror(factory):
+  try:
+    factory()
+  except ValueError:
+    return True
+  return False
+
+assert expect_valueerror(lambda: PipeLink(queue_maxsize=0))
+assert expect_valueerror(lambda: PipeLink(queue_maxsize=-1))
+assert expect_valueerror(lambda: PipeLink(quota=0))
+assert expect_valueerror(lambda: PipeLink(period=0))
+assert expect_valueerror(lambda: PipeLink(on_overflow="bogus"))
+assert expect_valueerror(lambda: PipeLink(on_stop="bogus"))
+assert expect_valueerror(lambda: PipeLink(drain_timeout=-1))
+assert PipeEngine().stats() == {}
+
+= BackPressureDrain preserves low and high ordering
+
+class SyncSource(AutoSource):
+  def exhausted(self):
+    return self.is_exhausted and self.empty()
+
+s = SyncSource()
+for i, high in enumerate([False, True, False, True, False, True]):
+  if high:
+    s._gen_high_data(i)
+  else:
+    s._gen_data(i)
+
+s.is_exhausted = True
+link = PipeLink(name="bp_order", queue_maxsize=2)
+b = link.buffer()
+lo = QueueSink(name="lo")
+hi = QueueSink(name="hi")
+s > b
+s >> b
+b > lo
+b >> hi
+p = PipeEngine(s)
+p.start()
+p.wait_and_stop()
+assert [lo.q.get() for _ in range(lo.q.qsize())] == [0, 2, 4]
+assert [hi.q.get() for _ in range(hi.q.qsize())] == [1, 3, 5]
+assert link.delivered == 6 and link.dropped == 0 and link.backlog == 0
+assert p.stats()["bp_order"]["state"] == "stopped"
+
+= Wait overflow policy applies backpressure
+
+class SyncFeeder(CLIFeeder):
+  def exhausted(self):
+    return self.is_exhausted and self.empty()
+
+class CountSink(Sink):
+  def __init__(self, delay=0.0):
+    Sink.__init__(self)
+    self.delay = delay
+    self.got = []
+  def push(self, msg):
+    time.sleep(self.delay)
+    self.got.append(msg)
+  def high_push(self, msg):
+    time.sleep(self.delay)
+    self.got.append(msg)
+
+link = PipeLink(name="bp_wait", queue_maxsize=2)
+b = link.buffer()
+c = CountSink(delay=0.05)
+s = CLIFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(20):
+  s.send(i)
+
+deadline = time.time() + 10
+maxbacklog = 0
+while len(c.got) < 20 and time.time() < deadline:
+  maxbacklog = max(maxbacklog, link.backlog)
+  time.sleep(0.01)
+
+p.stop()
+assert c.got == list(range(20))
+assert link.dropped == 0 and link.delivered == 20
+assert maxbacklog <= 2 and maxbacklog >= 1
+
+= Drop overflow policy is counted and observable
+
+link = PipeLink(name="bp_drop", queue_maxsize=1,
+                on_overflow=PIPE_OVERFLOW_DROP,
+                on_stop=PIPE_STOP_DISCARD)
+b = link.buffer()
+c = CountSink(delay=0.02)
+s = SyncFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(30):
+  s.send(i)
+
+s.close()
+while not s.empty():
+  time.sleep(0.01)
+
+p.stop()
+assert 0 < link.dropped < 30
+assert link.delivered + link.dropped == 30
+st = p.stats()["bp_drop"]
+assert st["dropped"] == link.dropped and st["state"] == "stopped"
+
+= Error overflow policy fails the whole chain
+
+link = PipeLink(name="bp_error", queue_maxsize=1,
+                on_overflow=PIPE_OVERFLOW_ERROR)
+b = link.buffer()
+c = CountSink(delay=0.05)
+s = CLIFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(30):
+  s.send(i)
+
+deadline = time.time() + 5
+while link.state != "error" and time.time() < deadline:
+  time.sleep(0.02)
+
+p.stop()
+assert link.state == "error"
+assert isinstance(link.error, PipeLinkFull)
+assert link.dropped == 0
+assert link.delivered < 30
+assert p.stats()["bp_error"]["state"] == "error"
+
+= Drain on stop delivers the whole backlog
+
+link = PipeLink(name="bp_drain", queue_maxsize=100, drain_timeout=5)
+b = link.buffer()
+c = CountSink(delay=0.005)
+s = SyncFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(50):
+  s.send(i)
+
+s.close()
+while not s.empty():
+  time.sleep(0.01)
+
+p.stop()
+assert c.got == list(range(50))
+assert link.dropped == 0 and link.delivered == 50
+
+= Discard on stop drops the backlog immediately
+
+link = PipeLink(name="bp_discard", queue_maxsize=100,
+                on_stop=PIPE_STOP_DISCARD)
+b = link.buffer()
+c = CountSink(delay=0.05)
+s = SyncFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(50):
+  s.send(i)
+
+s.close()
+while not s.empty():
+  time.sleep(0.01)
+
+t0 = time.time()
+p.stop()
+dt = time.time() - t0
+assert dt < 1.0
+assert link.dropped > 0
+assert link.delivered + link.dropped == 50
+
+= Drain deadline bounds the shutdown
+
+link = PipeLink(name="bp_deadline", queue_maxsize=100, drain_timeout=0.5)
+b = link.buffer()
+c = CountSink(delay=0.05)
+s = SyncFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(50):
+  s.send(i)
+
+s.close()
+while not s.empty():
+  time.sleep(0.01)
+
+t0 = time.time()
+p.stop()
+dt = time.time() - t0
+assert 0.4 <= dt < 2.0
+assert link.dropped > 0
+assert link.delivered + link.dropped == 50
+
+= Quota paces the delivery of a link
+
+link = PipeLink(name="bp_quota", queue_maxsize=50, quota=2, period=1.0)
+b = link.buffer()
+c = QueueSink()
+s = CLIFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(6):
+  s.send(i)
+
+t0 = time.time()
+got = [c.q.get(timeout=5) for _ in range(6)]
+dt = time.time() - t0
+p.stop()
+assert got == list(range(6))
+assert 1.5 < dt < 4.0
+assert link.delivered == 6
+
+= Concurrent links do not share their quotas
+
+slow_link = PipeLink(name="bp_slow", queue_maxsize=50, quota=2, period=1.0)
+fast_link = PipeLink(name="bp_fast", queue_maxsize=50, quota=5, period=1.0)
+slow_buf = slow_link.buffer()
+fast_buf = fast_link.buffer()
+slow_sink = QueueSink()
+fast_sink = QueueSink()
+slow_src = CLIFeeder()
+fast_src = CLIFeeder()
+slow_src > slow_buf > slow_sink
+fast_src > fast_buf > fast_sink
+p = PipeEngine(slow_src, fast_src)
+p.start()
+for i in range(12):
+  slow_src.send(i)
+  fast_src.send(i)
+
+t0 = time.time()
+got = [fast_sink.q.get(timeout=5) for _ in range(12)]
+dt = time.time() - t0
+slow_count = slow_sink.q.qsize()
+assert got == list(range(12))
+assert slow_count <= 2 + 2 * dt + 2
+while not slow_src.empty() or not fast_src.empty():
+  time.sleep(0.01)
+
+p.stop()
+assert slow_link.delivered == 12 and fast_link.delivered == 12
+
+= Engine reports per-link and per-queue metrics
+
+link = PipeLink(name="bp_stats", queue_maxsize=2)
+b = link.buffer()
+c = CountSink(delay=0.05)
+s = CLIFeeder()
+s > b > c
+p = PipeEngine(s)
+p.start()
+for i in range(10):
+  s.send(i)
+
+time.sleep(0.1)
+st = p.stats()
+assert set(st) == {"bp_stats"}
+entry = st["bp_stats"]
+assert set(entry) == {"state", "backlog", "dropped", "delivered", "rate",
+                      "queues"}
+assert entry["state"] == "active"
+assert entry["queues"][0]["name"] == b.name
+assert entry["backlog"] >= 1
+assert entry["queues"][0]["backlog"] == entry["backlog"]
+p.stop()
+assert p.stats()["bp_stats"]["state"] == "stopped"
+

@@ -7,7 +7,8 @@ import os
 import queue
 import subprocess
 import time
-from threading import Lock, Thread
+from math import exp
+from threading import Event, Lock, Thread
 
 from scapy.automaton import (
     Message,
@@ -15,8 +16,8 @@ from scapy.automaton import (
     select_objects,
 )
 from scapy.consts import WINDOWS
-from scapy.error import log_runtime, warning
 from scapy.config import conf
+from scapy.error import Scapy_Exception, log_runtime, warning
 from scapy.utils import get_temp_file, do_graph
 
 from typing import (
@@ -24,6 +25,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    List,
     Optional,
     Set,
     Tuple,
@@ -32,6 +34,40 @@ from typing import (
     TypeVar,
     cast,
 )
+
+#: Upstream producer waits until room is available in the link queue
+PIPE_OVERFLOW_WAIT = "wait"
+#: Upstream message is dropped (and counted) when the link queue is full
+PIPE_OVERFLOW_DROP = "drop"
+#: A :class:`PipeLinkFull` is raised and the whole chain is marked errored
+PIPE_OVERFLOW_ERROR = "error"
+
+#: On engine stop, keep pumping until the link queue is empty (or deadline)
+PIPE_STOP_DRAIN = "drain"
+#: On engine stop, discard the link queue immediately
+PIPE_STOP_DISCARD = "discard"
+
+
+class PipeLinkFull(Scapy_Exception):
+    """Raised on a pipe link whose overflow policy is ``"error"``
+
+    The link stays in the ``"error"`` state and the whole connected chain
+    is removed from the engine scheduling.
+    """
+
+    def __init__(self, link, piece=None):
+        # type: (PipeLink, Optional[Pipe]) -> None
+        self.link = link
+        self.piece = piece
+        Scapy_Exception.__init__(
+            self,
+            "pipe link %r queue is full (maxsize=%s)" % (
+                link.name, link.queue_maxsize))
+
+
+# Set of sources handled by the engine loop (the engine itself is used
+# as its own command source). Forward references are resolved lazily.
+_SourcesSet = Set[Union["Source", "PipeEngine"]]
 
 
 class PipeEngine(ObjectPipe[str]):
@@ -66,6 +102,8 @@ class PipeEngine(ObjectPipe[str]):
         self.thread_lock = Lock()
         self.command_lock = Lock()
         self.thread = None  # type: Optional[Thread]
+        # Pipes belonging to a chain stopped by an "error" overflow link
+        self._failed_pipes = set()  # type: Set[Pipe]
 
     def __getattr__(self, attr):
         # type: (str) -> Callable[..., Pipe]
@@ -123,6 +161,71 @@ class PipeEngine(ObjectPipe[str]):
             self.add_one_pipe(q)
         return pl
 
+    def _mark_component_failed(self, origin, sources, exhausted):
+        # type: (Pipe, _SourcesSet, _SourcesSet) -> None
+        # Stop scheduling every source of the chain connected to origin
+        for p in self.get_pipe_list(origin):
+            self._failed_pipes.add(p)
+            if isinstance(p, Source):
+                exhausted.add(p)
+                sources.discard(p)
+
+    def _reconcile_failed_links(self, sources, exhausted):
+        # type: (_SourcesSet, _SourcesSet) -> None
+        # A link may also fail from a producer thread outside of deliver();
+        # catch those failures here and stop their chain as well.
+        for p in self.active_pipes:
+            if isinstance(p, BackPressureDrain) and p.link.state == "error":
+                if p not in self._failed_pipes:
+                    self._mark_component_failed(p, sources, exhausted)
+
+    def _stop_with_buffers(self, buffers):
+        # type: (List[BackPressureDrain]) -> None
+        # Shutdown honoring the per-link drain/discard declarations:
+        # 1. stop producers that cannot receive buffered messages anymore,
+        # 2. shut the buffers down (they drain or discard their queues),
+        # 3. stop the remaining pieces that the buffers may push to.
+        buffer_set = set(buffers)  # type: Set[Pipe]
+        downstream = set()  # type: Set[Pipe]
+        stack = []  # type: List[Pipe]
+        for b in buffers:
+            b._upstream_buffers = self._upstream_buffers(b, buffer_set)
+            stack.extend(b.sinks | b.high_sinks | b.trigger_sinks)
+        while stack:
+            p = stack.pop()
+            if p in downstream:
+                continue
+            downstream.add(p)
+            stack.extend(p.sinks | p.high_sinks | p.trigger_sinks)
+        stopped = set()  # type: Set[Pipe]
+        for p in list(self.active_pipes):
+            if isinstance(p, Source) and p not in downstream:
+                p.stop()
+                stopped.add(p)
+        for b in buffers:
+            b.stop()
+            stopped.add(b)
+        for p in self.active_pipes - stopped:
+            p.stop()
+
+    @staticmethod
+    def _upstream_buffers(buffer, buffer_set):
+        # type: (BackPressureDrain, Set[Pipe]) -> Set[BackPressureDrain]
+        upstream = set()  # type: Set[BackPressureDrain]
+        stack = list(buffer.sources |
+                     buffer.high_sources |
+                     buffer.trigger_sources)  # type: List[Pipe]
+        while stack:
+            p = stack.pop()
+            if p in upstream:
+                continue
+            if p in buffer_set:
+                # A buffer is a queueing boundary: do not cross it.
+                upstream.add(cast(BackPressureDrain, p))
+            else:
+                stack.extend(p.sources | p.high_sources | p.trigger_sources)
+        return upstream
+
     def run(self):
         # type: () -> None
         log_runtime.debug("Pipe engine thread started.")
@@ -131,10 +234,11 @@ class PipeEngine(ObjectPipe[str]):
                 p.start()
             sources = self.active_sources
             sources.add(self)
-            exhausted = set([])  # type: Set[Union[Source, PipeEngine]]
+            exhausted = set([])  # type: _SourcesSet
             RUN = True
             STOP_IF_EXHAUSTED = False
             while RUN and (not STOP_IF_EXHAUSTED or len(sources) > 1):
+                self._reconcile_failed_links(sources, exhausted)
                 fds = select_objects(sources, 0.5)
                 for fd in fds:
                     if fd is self:
@@ -145,7 +249,10 @@ class PipeEngine(ObjectPipe[str]):
                         elif cmd == "B":
                             STOP_IF_EXHAUSTED = True
                         elif cmd == "A":
-                            sources = self.active_sources - exhausted
+                            sources = {
+                                src for src in self.active_sources - exhausted
+                                if src not in self._failed_pipes
+                            }
                             sources.add(self)
                         else:
                             warning("Unknown internal pipe engine command: %r."
@@ -154,6 +261,9 @@ class PipeEngine(ObjectPipe[str]):
                         try:
                             fd.deliver()
                         except Exception as e:
+                            if isinstance(e, PipeLinkFull):
+                                self._mark_component_failed(
+                                    fd, sources, exhausted)
                             log_runtime.exception("piping from %s failed: %s",
                                                   fd.name, e)
                         else:
@@ -164,11 +274,53 @@ class PipeEngine(ObjectPipe[str]):
             pass
         finally:
             try:
-                for p in self.active_pipes:
-                    p.stop()
+                buffers = [
+                    p for p in self.active_pipes
+                    if isinstance(p, BackPressureDrain)
+                ]
+                if buffers:
+                    self._stop_with_buffers(buffers)
+                else:
+                    for p in self.active_pipes:
+                        p.stop()
             finally:
                 self.thread_lock.release()
                 log_runtime.debug("Pipe engine thread stopped.")
+
+    def stats(self):
+        # type: () -> Dict[str, Dict[str, Any]]
+        """Return the metrics of every declared link of the engine.
+
+        For each link name: ``state`` (``active``, ``error`` or
+        ``stopped``), ``backlog`` (queued messages), ``dropped``,
+        ``delivered``, ``rate`` (delivered messages per second, EMA) and
+        ``queues``, the per-buffer breakdown. Counters are summed over the
+        link buffers: with several buffers in a chain, ``delivered``
+        counts messages per buffer hop; ``queues`` keeps each hop apart.
+        """
+        links = {}  # type: Dict[PipeLink, List[BackPressureDrain]]
+        for p in self.active_pipes:
+            if isinstance(p, BackPressureDrain):
+                links.setdefault(p.link, []).append(p)
+        results = {}  # type: Dict[str, Dict[str, Any]]
+        for link, bufs in links.items():
+            results[link.name] = {
+                "state": link.state,
+                "backlog": sum(b.q.qsize() for b in bufs),
+                "dropped": sum(b.dropped for b in bufs),
+                "delivered": sum(b.delivered for b in bufs),
+                "rate": link.rate,
+                "queues": [
+                    {
+                        "name": b.name,
+                        "backlog": b.q.qsize(),
+                        "dropped": b.dropped,
+                        "delivered": b.delivered,
+                    }
+                    for b in bufs
+                ],
+            }
+        return results
 
     def start(self):
         # type: () -> None
@@ -883,3 +1035,340 @@ class DownDrain(Drain):
     def high_push(self, msg):
         # type: (Any) -> None
         self._send(msg)
+
+
+class PipeLink(object):
+    """Backpressure and quota declaration for a pipe chain.
+
+    A link is inserted into a chain by adding buffers between pipe
+    elements:
+
+    .. code:: python
+
+        link = PipeLink(queue_maxsize=100, quota=50, period=1.0,
+                        on_overflow=PIPE_OVERFLOW_DROP,
+                        on_stop=PIPE_STOP_DRAIN, drain_timeout=5)
+        s > link.buffer() > c
+
+    :param name: human-readable name used in :py:meth:`PipeEngine.stats`
+    :param queue_maxsize: maximum number of queued messages per buffer;
+                          ``None`` leaves the queue unbounded
+    :param quota: maximum number of messages delivered per ``period``
+                  seconds; ``None`` disables the quota
+    :param period: quota period in seconds (default 1)
+    :param on_overflow: ``PIPE_OVERFLOW_WAIT`` (wait for room, default),
+                        ``PIPE_OVERFLOW_DROP`` (drop and count) or
+                        ``PIPE_OVERFLOW_ERROR`` (raise
+                        :class:`PipeLinkFull` and fail the whole chain)
+    :param on_stop: ``PIPE_STOP_DRAIN`` (drain on stop, default) or
+                    ``PIPE_STOP_DISCARD`` (discard on stop)
+    :param drain_timeout: drain deadline in seconds; ``None`` waits until
+                          the queue is empty
+    :param on_error: optional callback ``f(link, exception)`` called once
+                     when the link enters the ``error`` state
+
+    Each link owns an independent quota bucket and set of counters: two
+    concurrent links never share tokens. Chains without a buffer keep
+    their previous behavior unchanged.
+    """
+
+    _counter = 0
+
+    def __init__(
+        self,
+        name=None,  # type: Optional[str]
+        queue_maxsize=None,  # type: Optional[int]
+        quota=None,  # type: Optional[float]
+        period=1.0,  # type: float
+        on_overflow=PIPE_OVERFLOW_WAIT,  # type: str
+        on_stop=PIPE_STOP_DRAIN,  # type: str
+        drain_timeout=None,  # type: Optional[float]
+        on_error=None,  # type: Optional[Callable[..., None]]
+    ):
+        # type: (...) -> None
+        if (queue_maxsize is not None and
+                (isinstance(queue_maxsize, bool) or
+                 not isinstance(queue_maxsize, int) or
+                 queue_maxsize <= 0)):
+            raise ValueError("queue_maxsize must be a positive integer "
+                             "or None")
+        if quota is not None and quota <= 0:
+            raise ValueError("quota must be positive or None")
+        if period <= 0:
+            raise ValueError("period must be positive")
+        if on_overflow not in (PIPE_OVERFLOW_WAIT, PIPE_OVERFLOW_DROP,
+                               PIPE_OVERFLOW_ERROR):
+            raise ValueError("on_overflow must be one of %r, %r or %r" % (
+                PIPE_OVERFLOW_WAIT, PIPE_OVERFLOW_DROP,
+                PIPE_OVERFLOW_ERROR))
+        if on_stop not in (PIPE_STOP_DRAIN, PIPE_STOP_DISCARD):
+            raise ValueError("on_stop must be one of %r or %r" % (
+                PIPE_STOP_DRAIN, PIPE_STOP_DISCARD))
+        if drain_timeout is not None and drain_timeout < 0:
+            raise ValueError("drain_timeout must be non-negative or None")
+        if name is None:
+            PipeLink._counter += 1
+            name = "link-%d" % PipeLink._counter
+        self.name = name
+        self.queue_maxsize = queue_maxsize
+        self.quota = quota
+        self.period = period
+        self.on_overflow = on_overflow
+        self.on_stop = on_stop
+        self.drain_timeout = drain_timeout
+        self.on_error = on_error
+        self.state = "active"  # type: str
+        self.error = None  # type: Optional[Exception]
+        self._buffers = set()  # type: Set[BackPressureDrain]
+        self._buffer_counter = 0
+        self._lock = Lock()
+        # Token bucket: the quota is the refill rate per period
+        self._tokens = (float(quota) if quota is not None
+                        else None)  # type: Optional[float]
+        self._token_time = time.monotonic()
+        # EMA of the delivery rate (time constant of one second)
+        self.rate = 0.0  # type: float
+        self._rate_time = 0.0
+
+    def buffer(self, name=None):
+        # type: (Optional[str]) -> BackPressureDrain
+        """Create a bounded buffer bound to this link."""
+        if name is None:
+            self._buffer_counter += 1
+            name = "%s[%d]" % (self.name, self._buffer_counter)
+        return BackPressureDrain(self, name=name)
+
+    def _register(self, buf):
+        # type: (BackPressureDrain) -> None
+        self._buffers.add(buf)
+
+    @property
+    def backlog(self):
+        # type: () -> int
+        return sum(b.q.qsize() for b in self._buffers)
+
+    @property
+    def received(self):
+        # type: () -> int
+        return sum(b.received for b in self._buffers)
+
+    @property
+    def delivered(self):
+        # type: () -> int
+        return sum(b.delivered for b in self._buffers)
+
+    @property
+    def dropped(self):
+        # type: () -> int
+        return sum(b.dropped for b in self._buffers)
+
+    def _acquire(self, running=None):
+        # type: (Optional[Callable[[], bool]]) -> bool
+        """Consume one quota token; return False if stopping while waiting."""
+        if self.quota is None:
+            return True
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                assert self._tokens is not None
+                self._tokens = min(
+                    float(self.quota),
+                    self._tokens +
+                    (now - self._token_time) * self.quota / self.period)
+                self._token_time = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return True
+                delay = ((1.0 - self._tokens) *
+                         self.period / self.quota)  # type: float
+            if running is not None and not running():
+                return False
+            time.sleep(min(0.1, max(0.0, delay)))
+
+    def _record_delivery(self):
+        # type: () -> None
+        now = time.monotonic()
+        with self._lock:
+            if self._rate_time:
+                dt = now - self._rate_time
+                if dt > 0:
+                    self.rate += (1.0 - exp(-dt)) * (1.0 / dt - self.rate)
+            self._rate_time = now
+
+    def _fail(self, exception):
+        # type: (Exception) -> Exception
+        with self._lock:
+            if self.state == "error":
+                assert self.error is not None
+                return self.error
+            self.state = "error"
+            self.error = exception
+            on_error = self.on_error
+        if on_error is not None:
+            on_error(self, exception)
+        return exception
+
+    def _mark_stopped(self):
+        # type: () -> None
+        with self._lock:
+            if self.state != "error":
+                self.state = "stopped"
+
+
+class BackPressureDrain(Drain):
+    """Bounded queue between pipe elements, paced by a :class:`PipeLink`.
+
+    Messages received on the low and high entries are enqueued in FIFO
+    order (the low/high interleaving is preserved) and delivered on the
+    matching exits by a dedicated pump thread, at the link quota rate.
+    This keeps the engine loop free of queue and quota waits, so two
+    concurrent links never block each other. Usually created through
+    :meth:`PipeLink.buffer`.
+    """
+
+    def __init__(self, link, name=None):
+        # type: (PipeLink, Optional[str]) -> None
+        Drain.__init__(self, name=name)
+        self.link = link
+        # queue.Queue treats a maxsize of 0 as unbounded, like None
+        self.q = queue.Queue(
+            maxsize=link.queue_maxsize or 0
+        )  # type: queue.Queue[Tuple[bool, Any]]
+        self.received = 0
+        self.delivered = 0
+        self.dropped = 0
+        self.RUN = False
+        self._draining = False
+        self._drain_deadline = None  # type: Optional[float]
+        self._stopping = False
+        self._finished = Event()
+        self._finished.set()
+        self._thread = None  # type: Optional[Thread]
+        self._upstream_buffers = set()  # type: Set[BackPressureDrain]
+        self.link._register(self)
+
+    def start(self):
+        # type: () -> None
+        if self._thread is None and not self._stopping:
+            self.RUN = True
+            self._finished.clear()
+            thread = Thread(
+                target=self._pump,
+                name="scapy.pipetool.BackPressureDrain")
+            thread.daemon = True
+            thread.start()
+            self._thread = thread
+
+    def push(self, msg):
+        # type: (Any) -> None
+        self._ingest(False, msg)
+
+    def high_push(self, msg):
+        # type: (Any) -> None
+        self._ingest(True, msg)
+
+    def _ingest(self, high, msg):
+        # type: (bool, Any) -> None
+        if self.link.state == "error":
+            raise PipeLinkFull(self.link, self)
+        item = (high, msg)
+        if self.link.on_overflow == PIPE_OVERFLOW_ERROR:
+            try:
+                self.q.put_nowait(item)
+            except queue.Full:
+                self.link._fail(PipeLinkFull(self.link, self))
+                raise
+        elif self.link.on_overflow == PIPE_OVERFLOW_DROP:
+            try:
+                self.q.put_nowait(item)
+            except queue.Full:
+                self.dropped += 1
+                return
+        else:
+            while True:
+                try:
+                    self.q.put(item, timeout=0.1)
+                    break
+                except queue.Full:
+                    if not self.RUN or self._stopping:
+                        self.dropped += 1
+                        return
+        self.received += 1
+
+    def _running(self):
+        # type: () -> bool
+        if not self.RUN:
+            return False
+        if (self._draining and self._drain_deadline is not None and
+                time.monotonic() >= self._drain_deadline):
+            return False
+        return True
+
+    def _upstreams_empty(self):
+        # type: () -> bool
+        return all(buf.q.empty() for buf in self._upstream_buffers)
+
+    def _pump(self):
+        # type: () -> None
+        try:
+            while self.RUN:
+                timeout = 0.1  # type: float
+                if self._draining and self._drain_deadline is not None:
+                    remaining = self._drain_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    timeout = min(timeout, remaining)
+                try:
+                    item = self.q.get(timeout=timeout)
+                except queue.Empty:
+                    # Stay alive while an upstream buffer may still feed us
+                    if self._draining and self._upstreams_empty():
+                        break
+                    continue
+                if not self.link._acquire(running=self._running):
+                    self.dropped += 1
+                    break
+                high, payload = item
+                try:
+                    if high:
+                        self._high_send(payload)
+                    else:
+                        self._send(payload)
+                except Exception as e:
+                    log_runtime.exception("piping from %s failed: %s",
+                                          self.name, e)
+                self.delivered += 1
+                self.link._record_delivery()
+        finally:
+            # Discard whatever the queue still holds (drain deadline,
+            # immediate stop or failed chain shutdown)
+            while True:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self.dropped += 1
+            self._finished.set()
+
+    def stop(self):
+        # type: () -> None
+        if self._thread is None:
+            return
+        if self._stopping:
+            self._finished.wait()
+            return
+        self._stopping = True
+        if self.link.on_stop == PIPE_STOP_DISCARD:
+            self.RUN = False
+            self._finished.wait()
+        else:
+            self._draining = True
+            if self.link.drain_timeout is not None:
+                self._drain_deadline = (time.monotonic() +
+                                        self.link.drain_timeout)
+            if not self._finished.wait(self.link.drain_timeout):
+                # Drain deadline expired: the pump discards and exits.
+                self.RUN = False
+                self._finished.wait()
+        self.link._mark_stopped()

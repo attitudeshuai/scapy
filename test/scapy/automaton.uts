@@ -421,6 +421,139 @@ sm.run()
 assert sm.count1 == 1
 assert sm.count2 == 6
 
+= Automaton runtime catalog: enumeration and running snapshot
+~ automaton
+import time
+
+# Stop and destroy the instances left over by the previous tests so that
+# the catalog starts from a clean, verifiable state.
+for atmt in enumerate_automata():
+    assert not atmt.isrunning()
+    atmt.destroy()
+
+assert enumerate_automata() == []
+assert enumerate_automata(running=True) == []
+assert enumerate_automata(running=False) == []
+
+class CatalogATMT(Automaton):
+    @ATMT.state(initial=1)
+    def BEGIN(self):
+        self.got = None
+    @ATMT.timer(BEGIN, 0.1)
+    def tick(self):
+        pass
+    @ATMT.timeout(BEGIN, 1)
+    def go_middle(self):
+        raise self.MIDDLE()
+    @ATMT.state()
+    def MIDDLE(self):
+        pass
+    @ATMT.ioevent(MIDDLE, name="inp")
+    def on_inp(self, fd):
+        self.got = fd.recv()
+        raise self.END()
+    @ATMT.state(final=1)
+    def END(self):
+        return "done"
+
+c = CatalogATMT(ll=lambda: None, recvsock=lambda: None)
+assert enumerate_automata() == [c]
+assert enumerate_automata(running=True) == [c]
+assert enumerate_automata(running=False) == []
+
+c.runbg(wait=False)
+# Wait until the control thread has consumed the RUN command.
+t0 = time.time()
+while c.snapshot().pending_messages:
+    assert time.time() - t0 < 2
+    time.sleep(0.01)
+
+snap = c.snapshot()
+assert snap.name == "CatalogATMT"
+assert snap.running is True
+assert snap.state == "BEGIN"
+assert snap.previous_state is None
+assert sorted((t.name, t.autoreload) for t in snap.timers) == [
+    ("go_middle", False),
+    ("tick", True),
+]
+assert all(0 <= t.remaining <= t.timeout for t in snap.timers)
+assert snap.pending_messages == 0
+
+= Automaton runtime catalog: snapshots are consistent and do not pause
+~ automaton
+# Hammer snapshots while the automaton keeps its select loop running:
+# state name and timer list must always match.
+t0 = time.time()
+while time.time() - t0 < 0.3:
+    s = c.snapshot()
+    assert s.running is True
+    assert s.state == "BEGIN"
+    assert {t.name for t in s.timers} == {"go_middle", "tick"}
+
+assert c.isrunning()
+
+= Automaton runtime catalog: pending messages and post-run snapshot
+~ automaton
+# "inp" is only listened to in MIDDLE: the message stays queued in BEGIN.
+c.io.inp.send("hello")
+time.sleep(0.2)
+snap = c.snapshot()
+assert snap.state == "BEGIN"
+assert snap.pending_messages == 1
+assert snap.queues["ioin:inp"] == 1
+
+# The queued message drives MIDDLE -> END when the automaton runs on.
+assert c.run() == "done"
+assert c.got == "hello"
+# run() returns as soon as the END message is consumed; wait for thread exit.
+t0 = time.time()
+while c.isrunning():
+    assert time.time() - t0 < 2
+    time.sleep(0.01)
+
+snap = c.snapshot()
+assert snap.running is False
+assert snap.state == "END"
+assert snap.previous_state == "MIDDLE"
+assert snap.timers == []
+assert snap.pending_messages == 0
+# A stopped, non-destroyed instance stays in the catalog.
+assert enumerate_automata() == [c]
+assert enumerate_automata(running=False) == [c]
+
+= Automaton runtime catalog: stop, restart and destroy
+~ automaton
+c2 = CatalogATMT(ll=lambda: None, recvsock=lambda: None)
+assert enumerate_automata() == [c, c2]
+c2.runbg(wait=False)
+time.sleep(0.2)
+c2.stop()
+assert not c2.isrunning()
+assert c2 in enumerate_automata()
+assert c2.snapshot().state == "BEGIN"
+
+# restart() keeps the same catalog entry and resets the transition history
+c2.restart()
+assert c2.isrunning()
+snap = c2.snapshot()
+assert snap.running is True
+assert snap.state == "BEGIN"
+assert snap.previous_state is None
+assert {t.name for t in snap.timers} == {"go_middle", "tick"}
+
+c2.io.inp.send("x")
+assert c2.run() == "done"
+t0 = time.time()
+while c2.isrunning():
+    assert time.time() - t0 < 2
+    time.sleep(0.01)
+
+# destroy() deregisters the instances; the catalog is empty again.
+c.destroy()
+c2.destroy()
+assert enumerate_automata() == []
+
 = Automaton graph
 ~ automaton
 

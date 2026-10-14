@@ -22,6 +22,7 @@ import threading
 import time
 import traceback
 import types
+import weakref
 
 import select
 from collections import deque
@@ -210,6 +211,10 @@ class ObjectPipe(Generic[_T]):
     def empty(self):
         # type: () -> bool
         return not bool(self.__queue)
+
+    def qsize(self):
+        # type: () -> int
+        return len(self.__queue)
 
     def flush(self):
         # type: () -> None
@@ -882,6 +887,101 @@ class Automaton_metaclass(type):
         return do_graph(s, **kargs)
 
 
+class AutomatonTimerSnapshot:
+    """
+    Immutable view of a live Timer of an Automaton at snapshot time.
+    See ``Automaton.snapshot()``.
+    """
+    def __init__(self, name, timeout, remaining, autoreload):
+        # type: (str, float, float, bool) -> None
+        self.name = name
+        self.timeout = timeout
+        self.remaining = remaining
+        self.autoreload = autoreload
+
+    def __repr__(self):
+        # type: () -> str
+        return "<AutomatonTimerSnapshot %s remaining=%.3f/timeout=%.3f%s>" % (
+            self.name, self.remaining, self.timeout,
+            " autoreload" if self.autoreload else "",
+        )
+
+
+class AutomatonSnapshot:
+    """
+    Consistent, immutable view of an Automaton instance at snapshot time.
+
+    The fields ``state`` and ``timers`` always belong to the same version of
+    the automaton: a snapshot can never mix a state name with the timer list
+    of another state.
+    """
+    def __init__(self, name, state, previous_state, running, timers,
+                 pending_messages, queues):
+        # type: (str, Optional[str], Optional[str], bool, List[AutomatonTimerSnapshot], int, Dict[str, int]) -> None  # noqa: E501
+        self.name = name
+        self.state = state
+        self.previous_state = previous_state
+        self.running = running
+        self.timers = timers
+        self.pending_messages = pending_messages
+        self.queues = queues
+
+    def __repr__(self):
+        # type: () -> str
+        return (
+            "<AutomatonSnapshot %s state=[%s] previous_state=[%s] running=%r "
+            "timers=%d pending_messages=%d>"
+        ) % (
+            self.name, self.state, self.previous_state, self.running,
+            len(self.timers), self.pending_messages,
+        )
+
+
+_ATMT_REGISTRY_LOCK = threading.Lock()
+_ATMT_REGISTRY = {}  # type: Dict[int, weakref.ref[Automaton]]
+
+
+def _atmt_register(instance):
+    # type: (Automaton) -> None
+    with _ATMT_REGISTRY_LOCK:
+        _ATMT_REGISTRY[id(instance)] = weakref.ref(instance)
+
+
+def _atmt_unregister(instance):
+    # type: (Automaton) -> None
+    with _ATMT_REGISTRY_LOCK:
+        _ATMT_REGISTRY.pop(id(instance), None)
+
+
+def enumerate_automata(running=None):
+    # type: (Optional[bool]) -> List[Automaton]
+    """
+    Enumerate the Automaton instances currently registered in the process,
+    i.e. instances that have been started and not yet destroyed. Both running
+    and stopped instances are returned unless filtered.
+
+    :param running: if True, only return running instances; if False, only
+        stopped ones; if None (default), return all.
+    """
+    with _ATMT_REGISTRY_LOCK:
+        items = list(_ATMT_REGISTRY.items())
+    instances = []
+    dead = []
+    for key, ref in items:
+        instance = ref()
+        if instance is None:
+            dead.append(key)
+        elif running is None or instance.isrunning() == running:
+            instances.append(instance)
+    if dead:
+        with _ATMT_REGISTRY_LOCK:
+            for key in dead:
+                dead_ref = _ATMT_REGISTRY.get(key)
+                if dead_ref is not None and dead_ref() is None:
+                    _ATMT_REGISTRY.pop(key, None)
+    return instances
+
+
 class Automaton(metaclass=Automaton_metaclass):
     states = {}             # type: Dict[str, _StateWrapper]
     state = None            # type: ATMT.NewStateRequested
@@ -918,6 +1018,10 @@ class Automaton(metaclass=Automaton_metaclass):
         self.atmt_socket = kargs.pop("atmt_socket", None)
         self.started = threading.Lock()
         self.threadid = None                # type: Optional[int]
+        # Version used by snapshot(): odd while a state transition is being
+        # published by the control thread, even otherwise.
+        self._atmt_version = 0              # type: int
+        self._atmt_previous_state = None    # type: Optional[str]
         self.breakpointed = None
         self.breakpoints = set()            # type: Set[_StateWrapper]
         self.interception_points = set()    # type: Set[_StateWrapper]
@@ -959,6 +1063,7 @@ class Automaton(metaclass=Automaton_metaclass):
                     _instance_state(getattr(self, stname)))
 
         self.start()
+        _atmt_register(self)
 
     def parse_args(self, debug=0, store=0, session=None, **kargs):
         # type: (int, int, Any, Any) -> None
@@ -1326,7 +1431,11 @@ class Automaton(metaclass=Automaton_metaclass):
             self.packets = PacketList(name="session[%s]" % self.__class__.__name__)
             try:
                 self.parse_args(*a, **k)
+                self._atmt_version += 1
+                self._atmt_previous_state = None
                 self.state = self.initial_states[0](self)
+                self.timeout[self.state.state].reset()
+                self._atmt_version += 1
                 self.send_sock = self.sock or self.send_sock_class(**self.socket_kargs)
                 if self.recv_conditions:
                     # Only start a receiving socket if we have at least one
@@ -1357,7 +1466,11 @@ class Automaton(metaclass=Automaton_metaclass):
                     elif c.type == _ATMT_Command.STOP:
                         if self.stop_state:
                             # There is a stop state
+                            self._atmt_version += 1
+                            self._atmt_previous_state = self.state.state
                             self.state = self.stop_state()
+                            self.timeout[self.state.state].reset()
+                            self._atmt_version += 1
                             iterator = self._do_iter()
                         else:
                             # Act as FORCESTOP
@@ -1494,7 +1607,11 @@ class Automaton(metaclass=Automaton_metaclass):
 
             except ATMT.NewStateRequested as state_req:
                 self.debug(2, "switching from [%s] to [%s]" % (self.state.state, state_req.state))  # noqa: E501
+                self._atmt_version += 1
+                self._atmt_previous_state = self.state.state
                 self.state = state_req
+                self.timeout[state_req.state].reset()
+                self._atmt_version += 1
                 yield state_req
 
     def __repr__(self):
@@ -1505,6 +1622,70 @@ class Automaton(metaclass=Automaton_metaclass):
         )
 
     # Public API
+    def snapshot(self):
+        # type: () -> AutomatonSnapshot
+        """
+        Return a consistent snapshot of the runtime state of the automaton:
+        current state, live timers, number of messages pending in the
+        internal pipes and the source state of the last transition.
+
+        The automaton is neither paused nor interrupted: its control thread
+        keeps sending and receiving while the snapshot is taken. State name
+        and timer list are guaranteed to come from the same version.
+        """
+        snap = None  # type: Optional[AutomatonSnapshot]
+        for _ in range(100):
+            version1 = self._atmt_version
+            if version1 & 1:
+                # A transition is being published, retry
+                continue
+            state_req = self.state
+            state = state_req.state if state_req is not None else None
+            previous_state = self._atmt_previous_state
+            timers = []  # type: List[AutomatonTimerSnapshot]
+            if state is not None:
+                for timer in self.timeout[state].timers:
+                    if not timer._expired:
+                        timers.append(
+                            AutomatonTimerSnapshot(
+                                name=timer._func.atmt_condname,
+                                timeout=timer._timeout,
+                                remaining=timer._remaining(),
+                                autoreload=timer._autoreload,
+                            )
+                        )
+            pipes = [
+                ("cmdin", self.cmdin),
+                ("cmdout", self.cmdout),
+            ]  # type: List[Tuple[str, ObjectPipe[Any]]]
+            pipes += [
+                ("ioin:%s" % name, pipe)
+                for name, pipe in self.ioin.items()
+                if isinstance(pipe, ObjectPipe)
+            ]
+            pipes += [
+                ("ioout:%s" % name, pipe)
+                for name, pipe in self.ioout.items()
+                if isinstance(pipe, ObjectPipe)
+            ]
+            queues = {}  # type: Dict[str, int]
+            pending_messages = 0
+            for qname, pipe in pipes:
+                qlen = pipe.qsize()
+                queues[qname] = qlen
+                pending_messages += qlen
+            if version1 == self._atmt_version:
+                return AutomatonSnapshot(
+                    name=self.__class__.__name__,
+                    state=state,
+                    previous_state=previous_state,
+                    running=self.isrunning(),
+                    timers=timers,
+                    pending_messages=pending_messages,
+                    queues=queues,
+                )
+        return cast(AutomatonSnapshot, snap)
+
     def add_interception_points(self, *ipts):
         # type: (Any) -> None
         for ipt in ipts:
@@ -1599,6 +1780,8 @@ class Automaton(metaclass=Automaton_metaclass):
             return  # was never started.
         if not force and self.isrunning():
             raise ValueError("Can't close running Automaton ! Call stop() beforehand")
+        # Remove from the runtime catalog
+        _atmt_unregister(self)
         # Close command pipes
         self.cmdin.close()
         self.cmdout.close()
